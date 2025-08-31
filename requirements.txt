@@ -1,7 +1,5 @@
 streamlit
-streamlit-webrtc
-langchain-core
-langchain-openai
 tldextract
 pyzbar
 pillow
+requests

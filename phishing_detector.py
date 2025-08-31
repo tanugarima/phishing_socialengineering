@@ -1,36 +1,41 @@
 import streamlit as st
-from langchain_core.prompts import PromptTemplate
-from langchain_openai import OpenAI
 import re
 from tldextract import extract
 from pyzbar.pyzbar import decode
 from PIL import Image
-import imaplib
-import email
-from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, RTCConfiguration, WebRtcMode
+import requests
 
-# Set up OpenAI LLM with API key from Streamlit secrets
-try:
-    llm = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY"), model="gpt-3.5-turbo")
-except KeyError:
-    st.error("OpenAI API key not found. Please set it in Streamlit secrets during deployment.")
-    st.stop()
+# VirusTotal API setup (replace with your free API key)
+VIRUSTOTAL_API_KEY = st.secrets.get("VIRUSTOTAL_API_KEY", "")
+VIRUSTOTAL_URL = "https://www.virustotal.com/api/v3/urls"
 
-# Define prompt template
-prompt = PromptTemplate(
-    input_variables=["text"],
-    template="Analyze this: {text}. Is it phishing or social engineering? Give risk level (low/medium/high) and reasons."
-)
+# Mock heuristic fallback
+def mock_phishing_analysis(text):
+    if "urgent" in text.lower() or "click" in text.lower() or "bank" in text.lower():
+        return "High risk: Contains urgent language or suspicious keywords."
+    elif any(word in text.lower() for word in ["verify", "account", "password"]):
+        return "Medium risk: Contains potential phishing indicators."
+    else:
+        return "Low risk: No obvious phishing indicators."
 
 # Text Detection (Emails/Messages)
 def detect_text(text):
     urls = extract_urls(text)
-    analysis = prompt | llm
-    text_result = analysis.invoke({"text": text})
+    if VIRUSTOTAL_API_KEY:
+        try:
+            result = analyze_with_virustotal(text if not urls else urls[0])
+            if result:
+                return result
+        except Exception as e:
+            st.warning(f"VirusTotal API error: {str(e)}. Using mock analysis.")
+            return mock_phishing_analysis(text)
+    else:
+        st.warning("VirusTotal API key not set. Using mock analysis.")
+        return mock_phishing_analysis(text)
     if urls:
         url_result = detect_url(urls[0])
-        return text_result + "\nURL Analysis: " + url_result
-    return text_result
+        return result + "\nURL Analysis: " + url_result
+    return result
 
 # URL Detection
 def extract_urls(text):
@@ -45,9 +50,54 @@ def url_features(url):
     }
 
 def detect_url(url):
-    features = url_features(url)
-    prompt_url = f"Analyze URL: {url}. Features: {features}. Risk level (low/medium/high) and reasons:"
-    return llm.invoke(prompt_url)
+    if VIRUSTOTAL_API_KEY:
+        try:
+            response = requests.post(
+                VIRUSTOTAL_URL,
+                headers={"x-apikey": VIRUSTOTAL_API_KEY},
+                json={"url": url}
+            )
+            response.raise_for_status()
+            data = response.json()
+            verdict = data.get('data', {}).get('attributes', {}).get('last_analysis_stats', {})
+            if verdict.get('malicious', 0) > 0:
+                return f"High risk: Detected as malicious by {verdict.get('malicious')} engines."
+            elif verdict.get('suspicious', 0) > 0:
+                return f"Medium risk: Detected as suspicious by {verdict.get('suspicious')} engines."
+            else:
+                return "Low risk: No malicious or suspicious detection."
+        except Exception as e:
+            st.warning(f"VirusTotal API error: {str(e)}. Using mock analysis.")
+            features = url_features(url)
+            risk = "Low risk" if features['https'] else "Medium risk"
+            return f"{risk}: URL length {features['length']}, HTTPS: {features['https']}, subdomains: {features['subdomains']}."
+    else:
+        st.warning("VirusTotal API key not set. Using mock analysis.")
+        features = url_features(url)
+        risk = "Low risk" if features['https'] else "Medium risk"
+        return f"{risk}: URL length {features['length']}, HTTPS: {features['https']}, subdomains: {features['subdomains']}."
+
+# Analyze with VirusTotal (simplified for text via URL context)
+def analyze_with_virustotal(input_data):
+    if isinstance(input_data, str) and not input_data.startswith('http'):
+        # For text, create a dummy URL or use text as context (limited by API)
+        return mock_phishing_analysis(input_data)  # VirusTotal doesn't directly analyze text; use mock
+    elif isinstance(input_data, str):
+        response = requests.post(
+            VIRUSTOTAL_URL,
+            headers={"x-apikey": VIRUSTOTAL_API_KEY},
+            json={"url": input_data}
+        )
+        response.raise_for_status()
+        data = response.json()
+        verdict = data.get('data', {}).get('attributes', {}).get('last_analysis_stats', {})
+        if verdict.get('malicious', 0) > 0:
+            return f"High risk: Detected as malicious by {verdict.get('malicious')} engines."
+        elif verdict.get('suspicious', 0) > 0:
+            return f"Medium risk: Detected as suspicious by {verdict.get('suspicious')} engines."
+        else:
+            return "Low risk: No malicious or suspicious detection."
+    return "Invalid input for analysis."
 
 # QR Code Detection
 def detect_qr(image_file):
@@ -70,76 +120,10 @@ def detect_voice(text_input):
         return "Please enter text to simulate voice input."
     return detect_text(text_input)
 
-# Email Checking Function
-def check_emails():
-    try:
-        # Connect to email server (e.g., Gmail IMAP settings)
-        mail = imaplib.IMAP4_SSL("imap.gmail.com")
-        email_user = st.secrets.get("EMAIL_USER", "")
-        email_pass = st.secrets.get("EMAIL_PASS", "")
-        if not email_user or not email_pass:
-            return "Email or password not set in secrets. Please configure EMAIL_USER and EMAIL_PASS."
-
-        mail.login(email_user, email_pass)
-        mail.select("inbox")
-        status, data = mail.search(None, "ALL")
-        email_ids = data[0].split()
-
-        results = []
-        for email_id in email_ids[-5:]:  # Check last 5 emails
-            status, msg_data = mail.fetch(email_id, "(RFC822)")
-            raw_email = msg_data[0][1]
-            msg = email.message_from_bytes(raw_email)
-            subject = msg["Subject"]
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
-                        body = part.get_payload(decode=True).decode()
-                        results.append(f"Subject: {subject}\nBody: {body[:200]}...\nAnalysis: {detect_text(body)}")
-            else:
-                body = msg.get_payload(decode=True).decode()
-                results.append(f"Subject: {subject}\nBody: {body[:200]}...\nAnalysis: {detect_text(body)}")
-
-        mail.logout()
-        return "\n\n".join(results) if results else "No emails found or error occurred."
-    except Exception as e:
-        return f"Error checking emails: {str(e)}"
-
-# Audio Processor for Real Voice Input
-class AudioProcessor(AudioProcessorBase):
-    def recv(self, frame):
-        return frame  # Return the audio frame for processing
-
-# Real Voice Input Function
-def process_voice():
-    try:
-        ctx = webrtc_streamer(
-            key="voice-input",
-            mode=WebRtcMode.SENDRECV,
-            rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
-            audio_processor_factory=AudioProcessor,
-        )
-        if ctx.state.playing:
-            st.write("Listening...")
-            audio_frame = ctx.audio_receiver.get_frame()
-            if audio_frame:
-                # Use OpenAI Whisper for transcription (requires OpenAI API)
-                transcription = llm.invoke("Transcribe this audio: " + audio_frame)  # Simplified; use Whisper API for accurate STT
-                st.write(f"Transcribed: {transcription}")
-                # Parse command
-                if "check my emails" in transcription.lower():
-                    st.write(check_emails())
-                elif "check specific email" in transcription.lower():
-                    st.write("Specify the email ID or subject.")  # Extend for specific email fetching
-                else:
-                    st.write(detect_text(transcription))
-    except Exception as e:
-        return f"Error processing voice: {str(e)}"
-
 # Streamlit UI
-st.title("Phishing & Social Engineering Detector (Cloud LLM Version)")
+st.title("Phishing & Social Engineering Detector (Free API Version)")
 
-input_type = st.selectbox("Choose Input", ["Text (Email/Message)", "URL", "QR Code Image", "Voice (Text Simulation)", "Check Emails", "Real Voice Command"])
+input_type = st.selectbox("Choose Input", ["Text (Email/Message)", "URL", "QR Code Image", "Voice (Text Simulation)"])
 
 if input_type == "Text (Email/Message)":
     text = st.text_area("Enter email or message (e.g., 'Click here to reset password')")
@@ -160,10 +144,3 @@ elif input_type == "Voice (Text Simulation)":
     text_input = st.text_area("Enter text to simulate voice input (e.g., 'Urgent bank alert')")
     if st.button("Detect"):
         st.write(detect_voice(text_input))
-
-elif input_type == "Check Emails":
-    if st.button("Check Latest Emails"):
-        st.write(check_emails())
-
-elif input_type == "Real Voice Command":
-    process_voice()
