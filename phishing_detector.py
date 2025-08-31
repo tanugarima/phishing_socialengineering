@@ -5,8 +5,11 @@ import re
 from tldextract import extract
 from pyzbar.pyzbar import decode
 from PIL import Image
+import imaplib
+import email
+from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, RTCConfiguration, WebRtcMode
 
-# Set up OpenAI LLM with API key from Streamlit secrets (set during deployment)
+# Set up OpenAI LLM with API key from Streamlit secrets
 try:
     llm = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY"), model="gpt-3.5-turbo")
 except KeyError:
@@ -46,7 +49,7 @@ def detect_url(url):
     prompt_url = f"Analyze URL: {url}. Features: {features}. Risk level (low/medium/high) and reasons:"
     return llm.invoke(prompt_url)
 
-# QR Code Detection (in-memory processing)
+# QR Code Detection
 def detect_qr(image_file):
     try:
         img = Image.open(image_file)
@@ -67,10 +70,76 @@ def detect_voice(text_input):
         return "Please enter text to simulate voice input."
     return detect_text(text_input)
 
+# Email Checking Function
+def check_emails():
+    try:
+        # Connect to email server (e.g., Gmail IMAP settings)
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        email_user = st.secrets.get("EMAIL_USER", "")
+        email_pass = st.secrets.get("EMAIL_PASS", "")
+        if not email_user or not email_pass:
+            return "Email or password not set in secrets. Please configure EMAIL_USER and EMAIL_PASS."
+
+        mail.login(email_user, email_pass)
+        mail.select("inbox")
+        status, data = mail.search(None, "ALL")
+        email_ids = data[0].split()
+
+        results = []
+        for email_id in email_ids[-5:]:  # Check last 5 emails
+            status, msg_data = mail.fetch(email_id, "(RFC822)")
+            raw_email = msg_data[0][1]
+            msg = email.message_from_bytes(raw_email)
+            subject = msg["Subject"]
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        body = part.get_payload(decode=True).decode()
+                        results.append(f"Subject: {subject}\nBody: {body[:200]}...\nAnalysis: {detect_text(body)}")
+            else:
+                body = msg.get_payload(decode=True).decode()
+                results.append(f"Subject: {subject}\nBody: {body[:200]}...\nAnalysis: {detect_text(body)}")
+
+        mail.logout()
+        return "\n\n".join(results) if results else "No emails found or error occurred."
+    except Exception as e:
+        return f"Error checking emails: {str(e)}"
+
+# Audio Processor for Real Voice Input
+class AudioProcessor(AudioProcessorBase):
+    def recv(self, frame):
+        return frame  # Return the audio frame for processing
+
+# Real Voice Input Function
+def process_voice():
+    try:
+        ctx = webrtc_streamer(
+            key="voice-input",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
+            audio_processor_factory=AudioProcessor,
+        )
+        if ctx.state.playing:
+            st.write("Listening...")
+            audio_frame = ctx.audio_receiver.get_frame()
+            if audio_frame:
+                # Use OpenAI Whisper for transcription (requires OpenAI API)
+                transcription = llm.invoke("Transcribe this audio: " + audio_frame)  # Simplified; use Whisper API for accurate STT
+                st.write(f"Transcribed: {transcription}")
+                # Parse command
+                if "check my emails" in transcription.lower():
+                    st.write(check_emails())
+                elif "check specific email" in transcription.lower():
+                    st.write("Specify the email ID or subject.")  # Extend for specific email fetching
+                else:
+                    st.write(detect_text(transcription))
+    except Exception as e:
+        return f"Error processing voice: {str(e)}"
+
 # Streamlit UI
 st.title("Phishing & Social Engineering Detector (Cloud LLM Version)")
 
-input_type = st.selectbox("Choose Input", ["Text (Email/Message)", "URL", "QR Code Image", "Voice (Text Simulation)"])
+input_type = st.selectbox("Choose Input", ["Text (Email/Message)", "URL", "QR Code Image", "Voice (Text Simulation)", "Check Emails", "Real Voice Command"])
 
 if input_type == "Text (Email/Message)":
     text = st.text_area("Enter email or message (e.g., 'Click here to reset password')")
@@ -91,3 +160,10 @@ elif input_type == "Voice (Text Simulation)":
     text_input = st.text_area("Enter text to simulate voice input (e.g., 'Urgent bank alert')")
     if st.button("Detect"):
         st.write(detect_voice(text_input))
+
+elif input_type == "Check Emails":
+    if st.button("Check Latest Emails"):
+        st.write(check_emails())
+
+elif input_type == "Real Voice Command":
+    process_voice()
