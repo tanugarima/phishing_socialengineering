@@ -1,0 +1,6 @@
+streamlit
+langchain-core
+langchain-openai
+tldextract
+pyzbar
+pillow
