@@ -3,4 +3,6 @@ streamlit-webrtc
 tldextract
 pyzbar
 pillow
-requests
+ollama
+vosk
+python-dotenv
