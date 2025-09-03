@@ -8,9 +8,11 @@ import email
 from vosk import Model, KaldiRecognizer, SetLogLevel
 import os
 import json
+from queue import Queue
 from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, RTCConfiguration, WebRtcMode
 from ollama import Client
 from dotenv import load_dotenv
+import email.policy
 
 # Load environment variables
 load_dotenv()
@@ -86,7 +88,6 @@ def detect_qr(image_file):
 # Voice Detection Classes
 class CommandVoiceProcessor(AudioProcessorBase):
     def __init__(self):
-        # Robust Vosk model path check
         base_dir = os.path.dirname(__file__)
         possible_models = ["vosk-model-small-en-us-0.15", "vosk-model-en-us-0.22"]
         self.model = None
@@ -99,20 +100,23 @@ class CommandVoiceProcessor(AudioProcessorBase):
             raise ValueError(f"No valid Vosk model found in {base_dir}. Check folder names: {possible_models}")
         self.recognizer = KaldiRecognizer(self.model, 16000)  # Sample rate 16000 Hz
         SetLogLevel(0)  # Enable minimal logging for debugging
-        self.transcription = ""
+        self.transcription_queue = Queue()
+        self.current_transcription = ""
 
     def recv(self, frame):
         if frame is not None:
             data = frame.to_ndarray().tobytes()
             if self.recognizer.AcceptWaveform(data):
                 result = json.loads(self.recognizer.Result())
-                self.transcription = result.get("text", "")
-                st.write(f"Vosk Result: {self.transcription}")  # Debug output
+                self.current_transcription = result.get("text", "")
+                st.write(f"Vosk Result: {self.current_transcription}")  # Debug output
+                self.transcription_queue.put(self.current_transcription)
             else:
                 partial = json.loads(self.recognizer.PartialResult())
-                self.transcription = partial.get("partial", "")
-                st.write(f"Vosk Partial: {self.transcription}")  # Debug output
-        return self.transcription
+                self.current_transcription = partial.get("partial", "")
+                st.write(f"Vosk Partial: {self.current_transcription}")  # Debug output
+                self.transcription_queue.put(self.current_transcription)
+        return self.current_transcription
 
 def process_command_voice():
     try:
@@ -125,9 +129,10 @@ def process_command_voice():
         )
         if ctx.state.playing:
             st.write("Listening for commands... (e.g., 'check my emails' or 'check specific email [subject]')")
+            audio_processor = ctx.audio_processor
             while ctx.state.playing:
-                transcription = ctx.audio_processor().transcription
-                if transcription:
+                if audio_processor.transcription_queue.qsize() > 0:
+                    transcription = audio_processor.transcription_queue.get()
                     st.write(f"Command Recognized: {transcription}")
                     if "check my emails" in transcription.lower():
                         st.write(check_emails())
@@ -143,7 +148,6 @@ def process_command_voice():
 
 class TextVoiceProcessor(AudioProcessorBase):
     def __init__(self):
-        # Robust Vosk model path check
         base_dir = os.path.dirname(__file__)
         possible_models = ["vosk-model-small-en-us-0.15", "vosk-model-en-us-0.22"]
         self.model = None
@@ -156,20 +160,23 @@ class TextVoiceProcessor(AudioProcessorBase):
             raise ValueError(f"No valid Vosk model found in {base_dir}. Check folder names: {possible_models}")
         self.recognizer = KaldiRecognizer(self.model, 16000)  # Sample rate 16000 Hz
         SetLogLevel(0)  # Enable minimal logging for debugging
-        self.transcription = ""
+        self.transcription_queue = Queue()
+        self.current_transcription = ""
 
     def recv(self, frame):
         if frame is not None:
             data = frame.to_ndarray().tobytes()
             if self.recognizer.AcceptWaveform(data):
                 result = json.loads(self.recognizer.Result())
-                self.transcription += result.get("text", "") + " "
-                st.write(f"Vosk Result: {self.transcription}")  # Debug output
+                self.current_transcription += result.get("text", "") + " "
+                st.write(f"Vosk Result: {self.current_transcription}")  # Debug output
+                self.transcription_queue.put(self.current_transcription)
             else:
                 partial = json.loads(self.recognizer.PartialResult())
-                self.transcription += partial.get("partial", "") + " "
-                st.write(f"Vosk Partial: {self.transcription}")  # Debug output
-        return self.transcription.strip()
+                self.current_transcription += partial.get("partial", "") + " "
+                st.write(f"Vosk Partial: {self.current_transcription}")  # Debug output
+                self.transcription_queue.put(self.current_transcription)
+        return self.current_transcription.strip()
 
 def process_text_voice():
     try:
@@ -182,12 +189,14 @@ def process_text_voice():
         )
         if ctx.state.playing:
             st.write("Reading mode: Speak the text to analyze (e.g., read an email). Press stop when done.")
+            audio_processor = ctx.audio_processor
             transcription = ""
             while ctx.state.playing:
-                current_text = ctx.audio_processor().transcription
-                if current_text != transcription:
-                    transcription = current_text
-                    st.write(f"Transcribed so far: {transcription}")
+                if audio_processor.transcription_queue.qsize() > 0:
+                    current_text = audio_processor.transcription_queue.get()
+                    if current_text != transcription:
+                        transcription = current_text
+                        st.write(f"Transcribed so far: {transcription}")
             if transcription:
                 st.write(f"Final Transcribed Text: {transcription}")
                 st.write(detect_text(transcription))
@@ -195,6 +204,14 @@ def process_text_voice():
         st.error(f"Error in text voice processing: {str(e)}")
 
 # Email Checking Functions
+def safe_decode(payload, charset=None):
+    try:
+        if charset:
+            return payload.decode(charset)
+        return payload.decode('utf-8', errors='replace')  # Replace invalid chars with �
+    except (UnicodeDecodeError, LookupError):
+        return payload.decode('utf-8', errors='replace')  # Fallback with replacement
+
 def check_emails():
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -209,16 +226,23 @@ def check_emails():
         for email_id in email_ids[-5:]:  # Check last 5 emails
             status, msg_data = mail.fetch(email_id, "(RFC822)")
             raw_email = msg_data[0][1]
-            msg = email.message_from_bytes(raw_email)
-            subject = msg["Subject"]
+            msg = email.message_from_bytes(raw_email, policy=email.policy.default)
+            subject = msg["Subject"] or "No Subject"
+            body = ""
+            charset = msg.get_content_charset() or 'utf-8'
+
             if msg.is_multipart():
-                for part in msg.walk():
+                for part in msg.iter_parts():
                     if part.get_content_type() == "text/plain":
-                        body = part.get_payload(decode=True).decode()
-                        results.append(f"Subject: {subject}\nBody: {body[:200]}...\nAnalysis: {detect_text(body)}")
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            body = safe_decode(payload, charset)
             else:
-                body = msg.get_payload(decode=True).decode()
-                results.append(f"Subject: {subject}\nBody: {body[:200]}...\nAnalysis: {detect_text(body)}")
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    body = safe_decode(payload, charset)
+
+            results.append(f"Subject: {subject}\nBody: {body[:200]}...\nAnalysis: {detect_text(body)}")
 
         mail.logout()
         return "\n\n".join(results) if results else "No emails found or error occurred."
@@ -239,16 +263,23 @@ def check_specific_email(subject):
         for email_id in email_ids:
             status, msg_data = mail.fetch(email_id, "(RFC822)")
             raw_email = msg_data[0][1]
-            msg = email.message_from_bytes(raw_email)
-            subject = msg["Subject"]
+            msg = email.message_from_bytes(raw_email, policy=email.policy.default)
+            subject = msg["Subject"] or "No Subject"
+            body = ""
+            charset = msg.get_content_charset() or 'utf-8'
+
             if msg.is_multipart():
-                for part in msg.walk():
+                for part in msg.iter_parts():
                     if part.get_content_type() == "text/plain":
-                        body = part.get_payload(decode=True).decode()
-                        results.append(f"Subject: {subject}\nBody: {body[:200]}...\nAnalysis: {detect_text(body)}")
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            body = safe_decode(payload, charset)
             else:
-                body = msg.get_payload(decode=True).decode()
-                results.append(f"Subject: {subject}\nBody: {body[:200]}...\nAnalysis: {detect_text(body)}")
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    body = safe_decode(payload, charset)
+
+            results.append(f"Subject: {subject}\nBody: {body[:200]}...\nAnalysis: {detect_text(body)}")
 
         mail.logout()
         return "\n\n".join(results) if results else f"No emails found with subject '{subject}'."
