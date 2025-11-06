@@ -20,26 +20,27 @@ import requests
 import zipfile
 import io
 from queue import Queue, Empty
+import html
+import io as _io
+import wave as _wave
+import struct as _struct
+import math as _math
 
-# Load environment variables
 load_dotenv()
 default_email = os.getenv("EMAIL_USER", "")
 default_pass = os.getenv("EMAIL_PASS", "")
 
-# Ollama client setup (runs locally)
 ollama_client = Client(host='http://localhost:11434')
 
-# MongoDB setup
 mongo_client = MongoClient("mongodb+srv://tanugarima712_db_user:4IMjrho5gk4cACtH@emailpass.9uc3vx6.mongodb.net/?retryWrites=true&w=majority&appName=EmailPass")
 db = mongo_client["phishing_detector"]
 credentials_collection = db["credentials"]
 email_checks_collection = db["email_checks"]
 processed_emails_collection = db["processed_emails"]
 
-# Global queue for thread-safe communication
-message_queue = Queue()
+if 'message_queue' not in st.session_state:
+    st.session_state.message_queue = Queue()
 
-# Initialize session state
 if 'monitoring_active' not in st.session_state:
     st.session_state.monitoring_active = False
 if 'monitor_thread' not in st.session_state:
@@ -51,7 +52,6 @@ if 'monitoring_messages' not in st.session_state:
 if 'last_check_time' not in st.session_state:
     st.session_state.last_check_time = None
 
-# Mock heuristic for fallback
 def mock_phishing_analysis(text):
     if "urgent" in text.lower() or "click" in text.lower() or "bank" in text.lower():
         return "Danger: Contains urgent language or suspicious keywords."
@@ -60,10 +60,17 @@ def mock_phishing_analysis(text):
     else:
         return "Safe: No obvious phishing indicators."
 
-# Text Detection (Emails/Messages)
 def detect_text(text):
     urls = extract_urls(text)
-    prompt = f"Analyze this text for phishing or social engineering: {text}. Provide risk level (Safe/Warning/Danger) and reasons."
+    prompt = (
+        "You are a phishing detector. Analyze the following text for phishing or social engineering risk. "
+        "Return ONLY a compact JSON object with this exact shape and keys and NO extra prose, code fences, or formatting: "
+        '{"risk":"SAFE|WARNING|DANGER","reasons":["concise reason 1","concise reason 2","concise reason 3"]}. '
+        "Always include 3 to 7 concise, user-facing reasons tailored to the input. "
+        "If SAFE, explain why it's safe (e.g., tone, sender, lack of malicious cues). "
+        "If WARNING or DANGER, explain the strongest indicators. "
+        "Text: "
+    ) + text
     try:
         response = ollama_client.chat(model='mistral', messages=[{"role": "user", "content": prompt}])
         text_result = response['message']['content']
@@ -71,19 +78,111 @@ def detect_text(text):
     except Exception as e:
         return f"LLM error: {str(e)}. Using mock analysis: {mock_phishing_analysis(text)}"
 
-# Extract danger level from analysis result
 def extract_danger_level(analysis_result):
-    analysis_lower = analysis_result.lower()
-    if "danger" in analysis_lower:
-        return "DANGER"
-    elif "warning" in analysis_lower:
-        return "WARNING"
-    elif "safe" in analysis_lower:
-        return "SAFE"
-    else:
-        return "UNKNOWN"
+    def _strip_code_fences(text):
+        text = text.strip()
+        if text.startswith("```"):
+            # Remove first fence line
+            text = "\n".join(text.splitlines()[1:])
+        if text.endswith("```"):
+            # Remove trailing fence line
+            lines = text.splitlines()
+            if lines:
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        return text
 
-# Get color for danger level
+    # If it's already a dict-like object, try to read risk
+    if isinstance(analysis_result, dict):
+        risk = analysis_result.get("risk", "").strip().upper()
+        if risk in ("SAFE", "WARNING", "DANGER"):
+            return risk
+
+    text_value = str(analysis_result)
+    cleaned = _strip_code_fences(text_value)
+
+    # Try JSON parse
+    try:
+        import json
+        # Extract the first JSON object if extra text surrounds it
+        start = cleaned.find('{')
+        end = cleaned.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            candidate = cleaned[start:end+1]
+            obj = json.loads(candidate)
+            risk = str(obj.get("risk", "")).strip().upper()
+            if risk in ("SAFE", "WARNING", "DANGER"):
+                return risk
+    except Exception:
+        pass
+
+    import re
+    # Prefer patterns that explicitly label risk
+    label_regex = re.compile(r"\b(risk|risk level)\s*[:=-]?\s*\b(safe|warning|danger)\b", re.I)
+    m = label_regex.search(cleaned)
+    if m:
+        return m.group(2).upper()
+
+    # As a cautious fallback, look for standalone tokens; prefer more severe only if uniquely present
+    has_danger = re.search(r"\b(danger)\b", cleaned, re.I) is not None
+    has_warning = re.search(r"\b(warning)\b", cleaned, re.I) is not None
+    has_safe = re.search(r"\b(safe)\b", cleaned, re.I) is not None and not re.search(r"\b(unsafe|not safe)\b", cleaned, re.I)
+
+    if has_danger and not (has_warning or has_safe):
+        return "DANGER"
+    if has_warning and not has_danger:
+        return "WARNING"
+    if has_safe and not (has_danger or has_warning):
+        return "SAFE"
+    return "UNKNOWN"
+
+def parse_analysis(analysis_result):
+    def _strip_code_fences(text):
+        text = text.strip()
+        if text.startswith("```"):
+            text = "\n".join(text.splitlines()[1:])
+        if text.endswith("```"):
+            lines = text.splitlines()
+            if lines:
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        return text
+
+    if isinstance(analysis_result, dict):
+        risk = str(analysis_result.get("risk", "UNKNOWN")).upper()
+        reasons = analysis_result.get("reasons", []) or []
+        return {"risk": risk, "reasons": reasons if isinstance(reasons, list) else [str(reasons)]}
+
+    text_value = str(analysis_result)
+    cleaned = _strip_code_fences(text_value)
+    try:
+        import json
+        start = cleaned.find('{')
+        end = cleaned.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            candidate = cleaned[start:end+1]
+            obj = json.loads(candidate)
+            risk = str(obj.get("risk", "UNKNOWN")).upper()
+            reasons = obj.get("reasons", []) or []
+            return {"risk": risk, "reasons": reasons if isinstance(reasons, list) else [str(reasons)]}
+    except Exception:
+        pass
+    # Fallback to danger level extractor only
+    return {"risk": extract_danger_level(analysis_result), "reasons": []}
+
+def render_analysis(analysis_result):
+    parsed = parse_analysis(analysis_result)
+    risk = parsed.get("risk", "UNKNOWN").upper()
+    reasons = parsed.get("reasons", [])
+    st.markdown(f"**Risk Level: {risk}**")
+    st.write("\n")
+    st.markdown("**Reasons:**")
+    if reasons:
+        for idx, reason in enumerate(reasons, start=1):
+            st.markdown(f"{idx}. {reason}")
+    else:
+        st.markdown("- No specific indicators provided by the analyzer.")
+
 def get_danger_color(danger_level):
     if "DANGER" in danger_level:
         return "red"
@@ -94,7 +193,6 @@ def get_danger_color(danger_level):
     else:
         return "gray"
 
-# URL Detection
 def extract_urls(text):
     return re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', text)
 
@@ -107,7 +205,17 @@ def url_features(url):
     }
 
 def detect_url(url):
-    prompt = f"Analyze this URL for phishing: {url}. Features: {url_features(url)}. Provide risk level (Safe/Warning/Danger) and reasons."
+    prompt = (
+        "You are a phishing detector. Analyze the following URL and its features for phishing risk. "
+        "Return ONLY a compact JSON object with this exact shape and keys and NO extra prose, code fences, or formatting: "
+        '{"risk":"SAFE|WARNING|DANGER","reasons":["concise reason 1","concise reason 2","concise reason 3"]}. '
+        "Always include 3 to 7 concise, user-facing reasons tailored to the URL and features. "
+        "If SAFE, explain why it's safe; if risky, highlight the strongest indicators. "
+        "URL: "
+        f"{url} "
+        "Features: "
+        f"{url_features(url)}"
+    )
     try:
         response = ollama_client.chat(model='mistral', messages=[{"role": "user", "content": prompt}])
         return response['message']['content']
@@ -116,7 +224,6 @@ def detect_url(url):
         risk = "Safe" if features['https'] else "Warning"
         return f"LLM error: {str(e)}. Using mock analysis: {risk}: URL length {features['length']}, HTTPS: {features['https']}, subdomains: {features['subdomains']}."
 
-# QR Code Detection
 def detect_qr(image_file):
     try:
         img = Image.open(image_file)
@@ -131,7 +238,6 @@ def detect_qr(image_file):
     except Exception as e:
         return f"Error decoding QR: {str(e)}"
 
-# Simple speech recognition using microphone
 def simple_voice_input(timeout=5, phrase_time_limit=8):
     recognizer = sr.Recognizer()
     
@@ -158,7 +264,6 @@ def simple_voice_input(timeout=5, phrase_time_limit=8):
     
     return None
 
-# Command voice processing
 def process_command_voice(email_user, email_pass):
     st.write("Voice Command Input")
     st.write("Speak commands like:")
@@ -220,7 +325,7 @@ def process_command_voice(email_user, email_pass):
                 st.write("Text Analysis Result")
                 danger_level = extract_danger_level(result)
                 st.write(f"Security Level: {danger_level}")
-                st.write(result)
+                render_analysis(result)
             else:
                 st.error("Please speak some text to analyze after 'analyze this text'")
                 
@@ -232,14 +337,12 @@ def process_command_voice(email_user, email_pass):
             st.write("- 'check specific email [subject]'")
             st.write("- 'analyze this text [your text here]'")
 
-# Count danger levels in email results
 def count_danger_levels(results_text):
     danger_count = results_text.lower().count('danger')
     warning_count = results_text.lower().count('warning')
     safe_count = results_text.lower().count('safe')
     return f"Danger: {danger_count}, Warning: {warning_count}, Safe: {safe_count}"
 
-# Text voice input for longer text analysis
 def process_text_voice():
     st.write("Text Voice Input")
     st.write("Speak the text you want to analyze for phishing")
@@ -252,16 +355,24 @@ def process_text_voice():
         danger_level = extract_danger_level(result)
         st.write(f"Security Level: {danger_level}")
         st.write("Analysis Result")
-        st.write(result)
+        render_analysis(result)
 
-# Email Checking Functions
 def safe_decode(payload, charset=None):
+    # Normalize various payload types defensively
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, bytes):
+        try:
+            if isinstance(charset, str) and charset:
+                return payload.decode(charset, errors='replace')
+            return payload.decode('utf-8', errors='replace')
+        except Exception:
+            return payload.decode('utf-8', errors='replace')
+    # Fallback for unexpected types (e.g., int)
     try:
-        if charset:
-            return payload.decode(charset)
-        return payload.decode('utf-8', errors='replace')
-    except (UnicodeDecodeError, LookupError):
-        return payload.decode('utf-8', errors='replace')
+        return str(payload)
+    except Exception:
+        return ""
 
 def check_emails(email_user, email_pass, limit=10):
     try:
@@ -273,7 +384,16 @@ def check_emails(email_user, email_pass, limit=10):
         results = []
         for email_id in email_ids:
             status, msg_data = mail.fetch(email_id, "(RFC822)")
-            raw_email = msg_data[0][1]
+            # Extract raw email bytes robustly
+            raw_chunks = []
+            for part in msg_data:
+                if isinstance(part, tuple) and isinstance(part[1], (bytes, bytearray)):
+                    raw_chunks.append(part[1])
+                elif isinstance(part, (bytes, bytearray)):
+                    raw_chunks.append(part)
+            raw_email = b"".join(raw_chunks)
+            if not raw_email:
+                continue
             msg = email.message_from_bytes(raw_email, policy=email.policy.default)
             subject = msg["Subject"] or "No Subject"
             from_address = msg["From"] or "Unknown Sender"
@@ -298,6 +418,55 @@ def check_emails(email_user, email_pass, limit=10):
     except Exception as e:
         return f"Error checking emails: {str(e)}"
 
+def check_emails_structured(email_user, email_pass, limit=10):
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail.login(email_user, email_pass)
+        mail.select("inbox")
+        status, data = mail.search(None, "ALL")
+        email_ids = data[0].split()[-limit:]
+        entries = []
+        for email_id in email_ids:
+            status, msg_data = mail.fetch(email_id, "(RFC822)")
+            raw_chunks = []
+            for part in msg_data:
+                if isinstance(part, tuple) and isinstance(part[1], (bytes, bytearray)):
+                    raw_chunks.append(part[1])
+                elif isinstance(part, (bytes, bytearray)):
+                    raw_chunks.append(part)
+            raw_email = b"".join(raw_chunks)
+            if not raw_email:
+                continue
+            msg = email.message_from_bytes(raw_email, policy=email.policy.default)
+            subject = msg["Subject"] or "No Subject"
+            from_address = msg["From"] or "Unknown Sender"
+            body = ""
+            charset = msg.get_content_charset() or 'utf-8'
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            body = safe_decode(payload, charset)
+                            break
+            else:
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    body = safe_decode(payload, charset)
+            analysis = detect_text(body)
+            parsed = parse_analysis(analysis)
+            entries.append({
+                "risk": parsed.get("risk", extract_danger_level(analysis)),
+                "from": from_address,
+                "subject": subject,
+                "body_snippet": body[:400] + ("..." if len(body) > 400 else ""),
+                "reasons": parsed.get("reasons", []),
+            })
+        mail.logout()
+        return entries
+    except Exception as e:
+        return {"error": str(e)}
+
 def check_recent_email(email_user, email_pass):
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -310,7 +479,16 @@ def check_recent_email(email_user, email_pass):
             return "No emails found in inbox."
         email_id = email_ids[-1]
         status, msg_data = mail.fetch(email_id, "(RFC822)")
-        raw_email = msg_data[0][1]
+        raw_chunks = []
+        for part in msg_data:
+            if isinstance(part, tuple) and isinstance(part[1], (bytes, bytearray)):
+                raw_chunks.append(part[1])
+            elif isinstance(part, (bytes, bytearray)):
+                raw_chunks.append(part)
+        raw_email = b"".join(raw_chunks)
+        if not raw_email:
+            mail.logout()
+            return "Failed to read recent email content."
         msg = email.message_from_bytes(raw_email, policy=email.policy.default)
         subject = msg["Subject"] or "No Subject"
         from_address = msg["From"] or "Unknown Sender"
@@ -345,7 +523,15 @@ def check_emails_from_sender(email_user, email_pass, sender_name):
         results = []
         for email_id in email_ids:
             status, msg_data = mail.fetch(email_id, "(RFC822)")
-            raw_email = msg_data[0][1]
+            raw_chunks = []
+            for part in msg_data:
+                if isinstance(part, tuple) and isinstance(part[1], (bytes, bytearray)):
+                    raw_chunks.append(part[1])
+                elif isinstance(part, (bytes, bytearray)):
+                    raw_chunks.append(part)
+            raw_email = b"".join(raw_chunks)
+            if not raw_email:
+                continue
             msg = email.message_from_bytes(raw_email, policy=email.policy.default)
             subject = msg["Subject"] or "No Subject"
             from_address = msg["From"] or "Unknown Sender"
@@ -381,7 +567,15 @@ def check_specific_email(email_user, email_pass, subject):
         results = []
         for email_id in email_ids:
             status, msg_data = mail.fetch(email_id, "(RFC822)")
-            raw_email = msg_data[0][1]
+            raw_chunks = []
+            for part in msg_data:
+                if isinstance(part, tuple) and isinstance(part[1], (bytes, bytearray)):
+                    raw_chunks.append(part[1])
+                elif isinstance(part, (bytes, bytearray)):
+                    raw_chunks.append(part)
+            raw_email = b"".join(raw_chunks)
+            if not raw_email:
+                continue
             msg = email.message_from_bytes(raw_email, policy=email.policy.default)
             subject = msg["Subject"] or "No Subject"
             from_address = msg["From"] or "Unknown Sender"
@@ -407,7 +601,7 @@ def check_specific_email(email_user, email_pass, subject):
     except Exception as e:
         return f"Error checking specific email: {str(e)}"
 
-def monitor_emails(email_user, email_pass, stop_event):
+def monitor_emails(email_user, email_pass, stop_event, queue_ref, check_interval_seconds: int = 120):
     processed_emails = set()
     try:
         persisted = processed_emails_collection.find_one({"email": email_user})
@@ -415,7 +609,7 @@ def monitor_emails(email_user, email_pass, stop_event):
             processed_emails = set(persisted.get("processed_ids", []))
     except Exception as e:
         print(f"Debug: Adding error to queue - Failed to load processed emails: {str(e)}")
-        message_queue.put(("error", f"Failed to load processed emails: {str(e)}"))
+        queue_ref.put(("error", f"Failed to load processed emails: {str(e)}"))
     last_check = datetime.now() - timedelta(minutes=10)
     mail = None
     try:
@@ -426,10 +620,10 @@ def monitor_emails(email_user, email_pass, stop_event):
                     mail.login(email_user, email_pass)
                     mail.select("inbox")
                     print(f"Debug: Adding info to queue - Connected to {email_user} inbox at {datetime.now().strftime('%H:%M:%S')}")
-                    message_queue.put(("info", f"Connected to {email_user} inbox at {datetime.now().strftime('%H:%M:%S')}"))
+                    queue_ref.put(("info", f"Connected to {email_user} inbox at {datetime.now().strftime('%H:%M:%S')}"))
                 except Exception as e:
                     print(f"Debug: Adding error to queue - IMAP login failed: {str(e)}")
-                    message_queue.put(("error", f"IMAP login failed: {str(e)}. Retrying in 30 seconds..."))
+                    queue_ref.put(("error", f"IMAP login failed: {str(e)}. Retrying in 30 seconds..."))
                     if mail:
                         try:
                             mail.logout()
@@ -440,23 +634,35 @@ def monitor_emails(email_user, email_pass, stop_event):
                     continue
             now = datetime.now()
             try:
-                if (now - last_check).total_seconds() >= 120:
+                if (now - last_check).total_seconds() >= check_interval_seconds:
                     mail.noop()
                     fifteen_minutes_ago = (now - timedelta(minutes=15)).strftime('%d-%b-%Y')
                     status, data = mail.search(None, f'(SINCE "{fifteen_minutes_ago}")')
                     if status != 'OK':
                         print(f"Debug: Adding error to queue - Failed to search emails")
-                        message_queue.put(("error", "Failed to search emails"))
+                        queue_ref.put(("error", "Failed to search emails"))
                         continue
                     email_ids = data[0].split()
                     new_emails = []
                     for email_id in email_ids:
-                        if email_id not in processed_emails:
+                        # Normalize ID to a string key for set comparisons/persistence
+                        id_key = email_id.decode() if isinstance(email_id, (bytes, bytearray)) else str(email_id)
+                        if id_key not in processed_emails:
                             try:
-                                status, msg_data = mail.fetch(email_id, "(RFC822)")
+                                # imaplib accepts str; ensure we pass string ID
+                                fetch_id = id_key
+                                status, msg_data = mail.fetch(fetch_id, "(RFC822)")
                                 if status != 'OK':
                                     continue
-                                raw_email = msg_data[0][1]
+                                raw_chunks = []
+                                for part in msg_data:
+                                    if isinstance(part, tuple) and isinstance(part[1], (bytes, bytearray)):
+                                        raw_chunks.append(part[1])
+                                    elif isinstance(part, (bytes, bytearray)):
+                                        raw_chunks.append(part)
+                                raw_email = b"".join(raw_chunks)
+                                if not raw_email:
+                                    continue
                                 msg = email.message_from_bytes(raw_email, policy=email.policy.default)
                                 subject = msg["Subject"] or "No Subject"
                                 from_address = msg["From"] or "Unknown Sender"
@@ -476,6 +682,12 @@ def monitor_emails(email_user, email_pass, stop_event):
                                         body = safe_decode(payload, charset)
                                 analysis = detect_text(body)
                                 danger_level = extract_danger_level(analysis)
+                                try:
+                                    parsed = parse_analysis(analysis)
+                                    reasons_list = parsed.get("reasons", [])
+                                except Exception:
+                                    reasons_list = []
+                                reasons_items = "".join(f"<li>{r}</li>" for r in reasons_list) if reasons_list else "<li>No specific indicators provided.</li>"
                                 new_emails.append({
                                     "from": from_address,
                                     "subject": subject,
@@ -484,10 +696,10 @@ def monitor_emails(email_user, email_pass, stop_event):
                                     "analysis": analysis,
                                     "danger_level": danger_level
                                 })
-                                processed_emails.add(email_id)
+                                processed_emails.add(id_key)
                             except Exception as e:
                                 print(f"Debug: Adding error to queue - Error processing email {email_id}: {str(e)}")
-                                message_queue.put(("error", f"Error processing email {email_id}: {str(e)}"))
+                                queue_ref.put(("error", f"Error processing email {email_id}: {str(e)}"))
                                 continue
                     try:
                         processed_emails_collection.update_one(
@@ -497,7 +709,7 @@ def monitor_emails(email_user, email_pass, stop_event):
                         )
                     except Exception as e:
                         print(f"Debug: Adding warning to queue - Failed to save processed emails: {str(e)}")
-                        message_queue.put(("warning", f"Failed to save processed emails: {str(e)}"))
+                        queue_ref.put(("warning", f"Failed to save processed emails: {str(e)}"))
                     try:
                         email_checks_collection.insert_one({
                             "email": email_user,
@@ -507,31 +719,46 @@ def monitor_emails(email_user, email_pass, stop_event):
                         })
                     except Exception as e:
                         print(f"Debug: Adding warning to queue - Failed to log email check: {str(e)}")
-                        message_queue.put(("warning", f"Failed to log email check: {str(e)}"))
+                        queue_ref.put(("warning", f"Failed to log email check: {str(e)}"))
                     if new_emails:
-                        print(f"Debug: Adding success to queue - NEW EMAILS DETECTED at {now.strftime('%H:%M:%S')}")
-                        message_queue.put(("success", f"NEW EMAILS DETECTED at {now.strftime('%H:%M:%S')}"))
+                        print(f"Debug: Adding success to queue - NEW EMAILS DETECTED at {now.strftime('%H:%M:%S')} ({len(new_emails)})")
+                        queue_ref.put(("success", f"NEW EMAILS DETECTED ({len(new_emails)}) at {now.strftime('%H:%M:%S')}"))
+                        has_danger = any(e['danger_level'] == 'DANGER' for e in new_emails)
                         for i, email_data in enumerate(new_emails, 1):
                             color = get_danger_color(email_data['danger_level'])
+                            # Parse reasons again here for display (safe if missing)
+                            try:
+                                parsed_disp = parse_analysis(email_data['analysis'])
+                                reasons_disp = parsed_disp.get('reasons', [])
+                            except Exception:
+                                reasons_disp = []
+                            reasons_items = "".join(f"<li style=\"color:#000;\">{html.escape(str(r))}</li>" for r in reasons_disp) if reasons_disp else "<li style=\"color:#000;\">No specific indicators provided.</li>"
+                            subj = html.escape(email_data['subject'])
+                            frm = html.escape(email_data['from'])
+                            dt = html.escape(email_data['date'])
+                            preview = html.escape(email_data['body_snippet'])
                             email_display = f"""
-                            <div style="border: 2px solid {color}; padding: 15px; margin: 10px 0; border-radius: 10px; background-color: #f9f9f9;">
-                                <h3 style="color: {color}; margin-bottom: 10px;">{email_data['danger_level']}</h3>
-                                <div style="font-weight: bold; font-size: 16px;">Subject: {email_data['subject']}</div>
-                                <div>From: {email_data['from']}</div>
-                                <div>Date: {email_data['date']}</div>
-                                <div>Preview: {email_data['body_snippet']}</div>
-                                <div style="margin-top: 10px; font-style: italic;">Analysis: {email_data['analysis'][:150]}...</div>
+                            <div style=\"border: 2px solid {color}; padding: 15px; margin: 10px 0; border-radius: 10px; background-color: #fff; color:#000;\">
+                                <h3 style=\"color: {color}; margin-bottom: 10px;\">{email_data['danger_level']}</h3>
+                                <div style=\"font-weight: bold; font-size: 16px; color:#000;\">Subject: {subj}</div>
+                                <div style=\"color:#000;\">From: {frm}</div>
+                                <div style=\"color:#000;\">Date: {dt}</div>
+                                <div style=\"color:#000;\">Preview: {preview}</div>
+                                <div style=\"margin-top: 10px; font-weight: 600; color:#000;\">Reasons:</div>
+                                <ol style=\"margin-top: 4px; color:#000;\">{reasons_items}</ol>
                             </div>
                             """
                             print(f"Debug: Adding email to queue - Email {i} from {email_data['from']}")
-                            message_queue.put(("email", email_display))
+                            queue_ref.put(("email", email_display))
+                        if has_danger:
+                            queue_ref.put(("alert", "DANGER_DETECTED"))
                     else:
                         print(f"Debug: Adding info to queue - No new emails found at {now.strftime('%H:%M:%S')}")
-                        message_queue.put(("info", f"No new emails found at {now.strftime('%H:%M:%S')}. Checked {len(email_ids)} emails."))
+                        queue_ref.put(("info", f"No new emails found at {now.strftime('%H:%M:%S')}. Checked {len(email_ids)} emails."))
                     last_check = now
             except Exception as e:
                 print(f"Debug: Adding error to queue - Error during email check: {str(e)}")
-                message_queue.put(("error", f"Error during email check: {str(e)}. Reconnecting..."))
+                queue_ref.put(("error", f"Error during email check: {str(e)}. Reconnecting..."))
                 if mail:
                     try:
                         mail.logout()
@@ -542,7 +769,7 @@ def monitor_emails(email_user, email_pass, stop_event):
             time.sleep(5)
     except Exception as e:
         print(f"Debug: Adding error to queue - Error monitoring emails: {str(e)}")
-        message_queue.put(("error", f"Error monitoring emails: {str(e)}"))
+        queue_ref.put(("error", f"Error monitoring emails: {str(e)}"))
     finally:
         if mail:
             try:
@@ -550,18 +777,15 @@ def monitor_emails(email_user, email_pass, stop_event):
             except:
                 pass
 
-# Streamlit UI
 st.title("Phishing & Social Engineering Detector")
 st.write("Voice-enabled phishing detection using local LLM")
 
-# Credential input
 col1, col2 = st.columns(2)
 with col1:
     email_user = st.text_input("Enter Email", value=default_email)
 with col2:
     email_pass = st.text_input("Enter Password", type="password", value=default_pass)
 
-# Buttons for saving and deleting credentials
 col1, col2 = st.columns(2)
 with col1:
     if st.button("Save Credentials"):
@@ -600,12 +824,10 @@ if st.button("View Stored Credentials"):
     except Exception as e:
         st.error(f"Database error: {str(e)}")
 
-# Debug button to inspect session state
 if st.button("Debug Session State"):
     st.write("Session State Contents:")
     st.write(st.session_state)
 
-# Main input selection
 st.header("Choose Detection Method")
 input_type = st.selectbox("Select input type:", 
                          ["Text/Email", "URL", "QR Image", "Voice Command", "Text Voice Input", "Check Emails", "Monitor Emails"])
@@ -618,7 +840,7 @@ if input_type == "Text/Email":
         danger_level = extract_danger_level(result)
         st.write(f"Security Level: {danger_level}")
         st.write("Analysis Result")
-        st.write(result)
+        render_analysis(result)
 
 elif input_type == "URL":
     url = st.text_input("Enter URL to analyze")
@@ -628,7 +850,7 @@ elif input_type == "URL":
         danger_level = extract_danger_level(result)
         st.write(f"Security Level: {danger_level}")
         st.write("URL Analysis Result")
-        st.write(result)
+        render_analysis(result)
 
 elif input_type == "QR Image":
     uploaded = st.file_uploader("Upload QR image", type=["png", "jpg", "jpeg"])
@@ -638,7 +860,7 @@ elif input_type == "QR Image":
         danger_level = extract_danger_level(result)
         st.write(f"Security Level: {danger_level}")
         st.write("QR Code Analysis Result")
-        st.write(result)
+        render_analysis(result)
 
 elif input_type == "Voice Command":
     if email_user and email_pass:
@@ -652,11 +874,31 @@ elif input_type == "Text Voice Input":
 elif input_type == "Check Emails":
     if email_user and email_pass:
         with st.spinner("Checking emails..."):
-            result = check_emails(email_user, email_pass)
-        danger_counts = count_danger_levels(result)
-        st.write(f"Security Summary: {danger_counts}")
-        st.write("Email Check Results")
-        st.text_area("Results", result, height=400)
+            entries = check_emails_structured(email_user, email_pass)
+        if isinstance(entries, dict) and entries.get("error"):
+            st.error(f"Error: {entries['error']}")
+        elif not entries:
+            st.info("No emails found.")
+        else:
+            # Summary
+            summary_text = "\n".join(f"{e['risk']}" for e in entries)
+            st.write(f"Security Summary: {count_danger_levels(summary_text)}")
+            # Render each email cleanly
+            for e in entries:
+                color = get_danger_color(e['risk'])
+                st.markdown(f"**{e['risk']}**", unsafe_allow_html=False)
+                st.write(f"From: {e['from']}")
+                st.write(f"Subject: {e['subject']}")
+                if e.get('body_snippet'):
+                    st.write("Body:")
+                    st.code(e['body_snippet'])
+                st.markdown("**Reasons:**")
+                if e.get('reasons'):
+                    for i, r in enumerate(e['reasons'], start=1):
+                        st.markdown(f"{i}. {r}")
+                else:
+                    st.markdown("- No specific indicators provided.")
+                st.markdown("---")
     else:
         st.error("Please enter email and password first.")
 
@@ -674,9 +916,10 @@ elif input_type == "Monitor Emails":
                         st.session_state.monitoring_messages = []
                         st.session_state.last_check_time = None
                         st.session_state.stop_event = threading.Event()
+                        st.session_state.check_interval_seconds = 120
                         st.session_state.monitor_thread = threading.Thread(
                             target=monitor_emails, 
-                            args=(email_user, email_pass, st.session_state.stop_event), 
+                            args=(email_user, email_pass, st.session_state.stop_event, st.session_state.message_queue, st.session_state.check_interval_seconds), 
                             daemon=True
                         )
                         st.session_state.monitor_thread.start()
@@ -689,16 +932,35 @@ elif input_type == "Monitor Emails":
         if st.session_state.monitoring_active:
             current_time = datetime.now().strftime('%H:%M:%S')
             last_check_display = st.session_state.last_check_time or "Waiting for first check..."
-            status_placeholder.info(f"Monitoring active for {email_user} - Last check: {last_check_display} - Current time: {current_time}")
+            interval = st.session_state.get('check_interval_seconds', 120)
+            status_placeholder.info(f"Monitoring active for {email_user} - Last check: {last_check_display} - Next check every {interval}s - Current time: {current_time}")
+
+            # Thread health check and auto-restart option
+            if not (st.session_state.monitor_thread and st.session_state.monitor_thread.is_alive()):
+                if st.button("Restart Monitoring"):
+                    try:
+                        st.session_state.stop_event = threading.Event()
+                        st.session_state.monitor_thread = threading.Thread(
+                            target=monitor_emails,
+                            args=(email_user, email_pass, st.session_state.stop_event, st.session_state.message_queue, interval),
+                            daemon=True
+                        )
+                        st.session_state.monitor_thread.start()
+                        status_placeholder.success("Monitoring thread restarted.")
+                    except Exception as e:
+                        st.error(f"Failed to restart monitoring: {e}")
             
-            # Process all messages from queue
             new_messages = []
             while True:
                 try:
-                    msg_type, msg = message_queue.get_nowait()
+                    msg_type, msg = st.session_state.message_queue.get_nowait()
                     print(f"Debug: UI processing message - Type: {msg_type}, Content: {msg}")
                     if msg_type == "info" and "No new emails found at" in msg:
                         check_time = msg.split("at ")[-1].split('.')[0]
+                        st.session_state.last_check_time = check_time
+                    elif msg_type == "success" and "NEW EMAILS DETECTED" in msg:
+                        # Supports messages like: NEW EMAILS DETECTED (N) at HH:MM:SS
+                        check_time = msg.split("at ")[-1].strip()
                         st.session_state.last_check_time = check_time
                     new_messages.append((msg_type, msg))
                 except Empty:
@@ -707,16 +969,13 @@ elif input_type == "Monitor Emails":
                     new_messages.append(("error", f"Error retrieving message: {str(e)}"))
                     break
 
-            # Append new messages to session state
             for msg_type, msg in new_messages:
                 if (msg_type, msg) not in st.session_state.monitoring_messages:
                     st.session_state.monitoring_messages.append((msg_type, msg))
 
-            # Limit displayed messages
             max_messages = 50
             st.session_state.monitoring_messages = st.session_state.monitoring_messages[-max_messages:]
 
-            # Display messages
             with messages_placeholder.container():
                 if st.session_state.monitoring_messages:
                     danger_counts = count_danger_levels("\n".join(msg for _, msg in st.session_state.monitoring_messages))
@@ -731,33 +990,60 @@ elif input_type == "Monitor Emails":
                         elif msg_type == "success":
                             st.success(msg)
                         elif msg_type == "email":
-                            # Fallback to plain text if HTML fails
                             try:
-                                st.markdown(
-                                    f"""
-                                    <div style="border: 2px solid {get_danger_color(msg)}; padding: 15px; margin: 10px 0; border-radius: 10px; background-color: #f9f9f9;">
-                                        {msg}
-                                    </div>
-                                    """,
-                                    unsafe_allow_html=True
-                                )
+                                st.markdown(msg, unsafe_allow_html=True)
                             except Exception as e:
                                 st.write(f"Email display error: {e} - Content: {msg}")
+                        elif msg_type == "alert":
+                            # Stop monitoring and play a beep to alert user
+                            if st.session_state.monitoring_active:
+                                st.session_state.monitoring_active = False
+                                if hasattr(st.session_state, 'stop_event'):
+                                    try:
+                                        st.session_state.stop_event.set()
+                                    except Exception:
+                                        pass
+                            st.error("Danger email detected. Monitoring stopped. Messages remain visible for review.")
+                            # Generate a short beep sound
+                            try:
+                                def _generate_beep_bytes(duration_ms=500, freq=880, sample_rate=44100):
+                                    num_samples = int(sample_rate * (duration_ms / 1000.0))
+                                    buffer = _io.BytesIO()
+                                    with _wave.open(buffer, 'wb') as wf:
+                                        wf.setnchannels(1)
+                                        wf.setsampwidth(2)
+                                        wf.setframerate(sample_rate)
+                                        for i in range(num_samples):
+                                            t = i / sample_rate
+                                            sample = int(32767 * 0.4 * _math.sin(2 * _math.pi * freq * t))
+                                            wf.writeframes(_struct.pack('<h', sample))
+                                    return buffer.getvalue()
+                                st.audio(_generate_beep_bytes(), format='audio/wav')
+                            except Exception:
+                                pass
                         else:
                             st.write(msg)
                 else:
                     st.info("Monitoring active. Waiting for new emails...")
 
+            # If we received new messages, refresh immediately with debounce to avoid rerun loops
+            if new_messages and st.session_state.monitoring_active:
+                now_ts = datetime.now()
+                last = st.session_state.get('last_ui_update')
+                if not last or (now_ts - last).total_seconds() > 1.5:
+                    st.session_state.last_ui_update = now_ts
+                    try:
+                        st.rerun()
+                    except Exception:
+                        pass
+
             if st.button("Stop Monitoring"):
                 st.session_state.monitoring_active = False
                 if hasattr(st.session_state, 'stop_event'):
                     st.session_state.stop_event.set()
-                status_placeholder.success("Monitoring stopped.")
-                st.session_state.monitoring_messages = []
-                st.session_state.last_check_time = None
-                st.rerun()
+                status_placeholder.success("Monitoring stopped. Messages remain visible for review.")
+                # Do NOT clear messages or force a rerun; keep UI as-is so the user can review
 
-            # Adjust refresh interval to 10 seconds for better alignment
             if st.session_state.monitoring_active:
                 if (datetime.now() - st.session_state.last_ui_update).total_seconds() > 10:
                     st.session_state.last_ui_update = datetime.now()
@@ -766,7 +1052,6 @@ elif input_type == "Monitor Emails":
     else:
         st.error("Please enter email and password first.")
 
-# Installation instructions
 with st.expander("Installation Requirements"):
     st.write("""
     **Required packages:**
@@ -791,7 +1076,6 @@ with st.expander("Installation Requirements"):
     ```
     """)
 
-# Troubleshooting
 with st.expander("Troubleshooting Voice Input"):
     st.write("""
     **If voice input doesn't work:**
